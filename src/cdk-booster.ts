@@ -539,10 +539,7 @@ async function compileCdk({
   // calls for `emitDecoratorMetadata` (esbuild#257), which breaks runtime DI
   // libraries that resolve constructor/field types from metadata.
   let swcTransform:
-    | ((
-        code: string,
-        filename: string,
-      ) => Promise<{ code: string }>)
+    | ((code: string, filename: string) => Promise<{ code: string }>)
     | undefined;
   if (useSwcForDecorators) {
     try {

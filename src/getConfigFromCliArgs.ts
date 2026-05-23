@@ -61,9 +61,7 @@ function parseInteger(value: string): number {
 
 function parseDecoratorsMode(value: string): 'none' | 'swc' {
   if (value !== 'none' && value !== 'swc') {
-    throw new InvalidArgumentError(
-      `Expected "none" or "swc", got "${value}".`,
-    );
+    throw new InvalidArgumentError(`Expected "none" or "swc", got "${value}".`);
   }
   return value;
 }
