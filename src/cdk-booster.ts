@@ -970,6 +970,21 @@ async function compileCdk({
       sourcemap: true,
       plugins: [injectCodePlugin],
       tsconfig: tsconfig,
+      // When SWC pre-transpiles user .ts files, it cannot tell whether an
+      // import is type-only across file boundaries. With `decoratorMetadata`
+      // it pessimistically preserves the import so it can be referenced by
+      // a generated `Reflect.metadata("design:type", T)` call. If T's source
+      // file only exports an interface/type alias, the export evaporates
+      // after transpile and esbuild rejects the now-dangling import.
+      // tsc avoids this with cross-file type info; the eHawk app currently
+      // relies on Node's lenient module loader to ignore it. Downgrade the
+      // hard error to a warning so esbuild resolves the missing export to
+      // `undefined` (matching Node's runtime behavior). Safe because the
+      // affected refs are either erased type positions or harmless
+      // `Reflect.metadata(..., undefined)` calls.
+      ...(useSwcForDecorators
+        ? { logOverride: { 'import-is-undefined': 'warning' as const } }
+        : {}),
       ...(isESM
         ? {
             format: 'esm',
