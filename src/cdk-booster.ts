@@ -532,6 +532,46 @@ async function compileCdk({
   tsconfig?: string;
 }) {
   const isESM = await isEsm(entryFile);
+  const useSwcForDecorators = Configuration.config.decorators === 'swc';
+
+  // Lazy SWC loader. We only pay the resolution cost when --decorators=swc is set.
+  // The transform itself is needed because esbuild does not emit Reflect.metadata
+  // calls for `emitDecoratorMetadata` (esbuild#257), which breaks runtime DI
+  // libraries that resolve constructor/field types from metadata.
+  let swcTransform:
+    | ((
+        code: string,
+        filename: string,
+      ) => Promise<{ code: string }>)
+    | undefined;
+  if (useSwcForDecorators) {
+    try {
+      // @ts-ignore — optional peer dep, not in cdk-booster's own dependencies
+      const swc = await import('@swc/core');
+      swcTransform = (code, filename) =>
+        swc.transform(code, {
+          filename,
+          jsc: {
+            parser: { syntax: 'typescript', decorators: true },
+            target: 'es2020',
+            transform: {
+              legacyDecorator: true,
+              decoratorMetadata: true,
+            },
+            keepClassNames: true,
+          },
+          sourceMaps: 'inline',
+        });
+      Logger.verbose(
+        `Decorator metadata mode: SWC will pre-transpile user .ts files`,
+      );
+    } catch (err: any) {
+      throw new Error(
+        `--decorators=swc requires "@swc/core" to be installed in the project. Failed to import: ${err.message}`,
+        { cause: err },
+      );
+    }
+  }
 
   // Plugin that:
   // - Fixes __dirname issues in bundled code
@@ -885,6 +925,27 @@ async function compileCdk({
           );
 
           Logger.verbose(`Injected code into ${args.path}`);
+        }
+
+        // If --decorators=swc is on, pre-transpile user .ts files through SWC
+        // so `emitDecoratorMetadata` produces `Reflect.metadata(...)` calls that
+        // typedi / tsyringe / class-validator etc. rely on at runtime. esbuild
+        // still handles bundling, the `define` substitutions for __dirname etc.,
+        // and the CDK-internal patches applied above.
+        if (
+          swcTransform &&
+          args.path.endsWith('.ts') &&
+          !args.path.includes('node_modules')
+        ) {
+          try {
+            const { code } = await swcTransform(contents, args.path);
+            return { contents: code, loader: 'js' };
+          } catch (err: any) {
+            throw new Error(
+              `SWC failed to transpile ${args.path}: ${err.message}`,
+              { cause: err },
+            );
+          }
         }
 
         return {

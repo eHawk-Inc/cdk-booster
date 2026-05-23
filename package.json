@@ -1,15 +1,18 @@
 {
-  "name": "cdk-booster",
+  "name": "@eHawk-Inc/cdk-booster",
   "version": "0.0.1",
   "type": "module",
   "description": "Speed up AWS CDK's bundling of TypeScript/JavaScript Lambda handlers",
   "homepage": "https://www.cdkbooster.com",
   "repository": {
     "type": "git",
-    "url": "git@github.com:ServerlessLife/cdk-booster.git"
+    "url": "git+https://github.com/eHawk-Inc/cdk-booster.git"
   },
   "bugs": {
-    "url": "httpshttps://github.com/ServerlessLife/cdk-booster/issues"
+    "url": "https://github.com/eHawk-Inc/cdk-booster/issues"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "license": "MPL-2.0",
   "author": {
@@ -88,7 +91,13 @@
     "typescript": "~6.0.3"
   },
   "peerDependencies": {
-    "esbuild": "^0"
+    "esbuild": "^0",
+    "@swc/core": "^1"
+  },
+  "peerDependenciesMeta": {
+    "@swc/core": {
+      "optional": true
+    }
   },
   "bundleDependencies": [
     "chalk",
