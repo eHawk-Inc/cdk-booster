@@ -541,6 +541,15 @@ async function compileCdk({
   let swcTransform:
     | ((code: string, filename: string) => Promise<{ code: string }>)
     | undefined;
+  // TypeScript compiler API, used to find type-only exports in each user TS
+  // file. Loaded together with SWC because the two passes are paired: SWC emits
+  // metadata code that hedges on imported names being undefined at runtime
+  // (`typeof X === "undefined" ? Object : X`), but esbuild's bundler will not
+  // accept an import of an export that doesn't exist. So for every
+  // `export interface X` / `export type X` (with no companion value export),
+  // we append `export const X = void 0;` to the SWC output. The hedge picks up
+  // the `undefined` and falls back to `Object`.
+  let ts: typeof import('typescript') | undefined;
   if (useSwcForDecorators) {
     try {
       // @ts-ignore — optional peer dep, not in cdk-booster's own dependencies
@@ -559,8 +568,9 @@ async function compileCdk({
           },
           sourceMaps: 'inline',
         });
+      ts = (await import('typescript')).default;
       Logger.verbose(
-        `Decorator metadata mode: SWC will pre-transpile user .ts files`,
+        `Decorator metadata mode: SWC will pre-transpile user .ts files (with type-only export stubbing)`,
       );
     } catch (err: any) {
       throw new Error(
@@ -569,6 +579,73 @@ async function compileCdk({
       );
     }
   }
+
+  // Returns the names of top-level type-only exports in the given TS source
+  // that have NO companion value declaration of the same name (so the
+  // declaration-merging case `interface Foo {} ; class Foo {}` is excluded —
+  // the class export already covers it).
+  const findOrphanTypeOnlyExports = (
+    sourceText: string,
+    fileName: string,
+  ): string[] => {
+    if (!ts) return [];
+    const sf = ts.createSourceFile(
+      fileName,
+      sourceText,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+
+    const typeOnly = new Set<string>();
+    const valueExported = new Set<string>();
+
+    const hasExport = (node: import('typescript').Node): boolean => {
+      if (!ts!.canHaveModifiers(node)) return false;
+      const modifiers = ts!.getModifiers(node) ?? [];
+      return modifiers.some(
+        (m) => m.kind === ts!.SyntaxKind.ExportKeyword,
+      );
+    };
+
+    for (const stmt of sf.statements) {
+      if (ts.isInterfaceDeclaration(stmt) && hasExport(stmt)) {
+        typeOnly.add(stmt.name.text);
+      } else if (ts.isTypeAliasDeclaration(stmt) && hasExport(stmt)) {
+        typeOnly.add(stmt.name.text);
+      } else if (ts.isClassDeclaration(stmt) && stmt.name && hasExport(stmt)) {
+        valueExported.add(stmt.name.text);
+      } else if (
+        ts.isFunctionDeclaration(stmt) &&
+        stmt.name &&
+        hasExport(stmt)
+      ) {
+        valueExported.add(stmt.name.text);
+      } else if (ts.isVariableStatement(stmt) && hasExport(stmt)) {
+        for (const decl of stmt.declarationList.declarations) {
+          if (ts.isIdentifier(decl.name)) valueExported.add(decl.name.text);
+        }
+      } else if (ts.isEnumDeclaration(stmt) && hasExport(stmt)) {
+        valueExported.add(stmt.name.text);
+      } else if (
+        ts.isExportDeclaration(stmt) &&
+        stmt.exportClause &&
+        ts.isNamedExports(stmt.exportClause)
+      ) {
+        const wholeIsTypeOnly = stmt.isTypeOnly;
+        for (const spec of stmt.exportClause.elements) {
+          const name = spec.name.text;
+          if (wholeIsTypeOnly || spec.isTypeOnly) {
+            typeOnly.add(name);
+          } else {
+            valueExported.add(name);
+          }
+        }
+      }
+    }
+
+    for (const v of valueExported) typeOnly.delete(v);
+    return [...typeOnly];
+  };
 
   // Plugin that:
   // - Fixes __dirname issues in bundled code
@@ -935,8 +1012,27 @@ async function compileCdk({
           !args.path.includes('node_modules')
         ) {
           try {
+            // Collect orphan type-only exports from the ORIGINAL source (before
+            // SWC erases the type declarations) so we can stub them back in.
+            const orphanTypeExports = findOrphanTypeOnlyExports(
+              contents,
+              args.path,
+            );
+
             const { code } = await swcTransform(contents, args.path);
-            return { contents: code, loader: 'js' };
+
+            let outCode = code;
+            if (orphanTypeExports.length > 0) {
+              const stubs = orphanTypeExports
+                .map((name) => `export const ${name} = void 0;`)
+                .join('\n');
+              outCode += `\n// cdk-booster: stubs for type-only exports (consumed by SWC's typeof-undefined hedge)\n${stubs}\n`;
+              Logger.verbose(
+                `Stubbed ${orphanTypeExports.length} type-only export(s) in ${args.path}: ${orphanTypeExports.join(', ')}`,
+              );
+            }
+
+            return { contents: outCode, loader: 'js' };
           } catch (err: any) {
             throw new Error(
               `SWC failed to transpile ${args.path}: ${err.message}`,

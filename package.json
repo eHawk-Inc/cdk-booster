@@ -1,6 +1,6 @@
 {
   "name": "@ehawk-inc/cdk-booster",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "Speed up AWS CDK's bundling of TypeScript/JavaScript Lambda handlers",
   "homepage": "https://www.cdkbooster.com",
@@ -46,7 +46,8 @@
     "lint": "eslint . --fix",
     "prettier": "prettier . --write",
     "prepare": "husky",
-    "add-bang": "echo '#!/usr/bin/env node' | cat - ./dist/cdk-booster.mjs > ./dist/cdk-booster.mjs.tmp && mv ./dist/cdk-booster.mjs.tmp ./dist/cdk-booster.mjs",
+    "add-bang-original": "echo '#!/usr/bin/env node' | cat - ./dist/cdk-booster.mjs > ./dist/cdk-booster.mjs.tmp && mv ./dist/cdk-booster.mjs.tmp ./dist/cdk-booster.mjs",
+    "add-bang": "node add-bang.js",
     "build": "tsc -p tsconfig.build.json && cp src/cdkFrameworkWorker.mjs dist && node fix-imports.js && npm run add-bang",
     "deploy-github-role": "aws cloudformation deploy --stack-name cdk-booster-deploy-role --template-file cloudformation/gitHubDeployRole.yaml --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --profile cdkbooster",
     "deploy-tests": "npm run deploy --workspaces --if-present --parallel",
