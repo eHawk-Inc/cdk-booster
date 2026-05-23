@@ -602,9 +602,7 @@ async function compileCdk({
     const hasExport = (node: import('typescript').Node): boolean => {
       if (!ts!.canHaveModifiers(node)) return false;
       const modifiers = ts!.getModifiers(node) ?? [];
-      return modifiers.some(
-        (m) => m.kind === ts!.SyntaxKind.ExportKeyword,
-      );
+      return modifiers.some((m) => m.kind === ts!.SyntaxKind.ExportKeyword);
     };
 
     for (const stmt of sf.statements) {
