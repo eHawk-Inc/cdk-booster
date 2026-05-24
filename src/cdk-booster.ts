@@ -1035,6 +1035,36 @@ async function compileCdk({
           );
 
           Logger.verbose(`Injected code into ${args.path}`);
+        } else if (
+          args.path.includes(
+            path.join('aws-cdk-lib', 'core', 'lib', 'bundling.'),
+          )
+        ) {
+          // isSeLinux() in core/lib/bundling.js does:
+          //   spawnSync("selinuxenabled", [], { stdio: ["pipe", process.stderr, "inherit"] })
+          // It is called from DockerImage.run when building the `-v` mount
+          // args (SELinux relabel suffix). On Linux runners this fires for
+          // every Docker-backed asset bundling, including `PythonLayerVersion`
+          // during construct creation, and crashes the worker with
+          // ERR_INVALID_ARG_VALUE on the WritableWorkerStdio stream.
+          //
+          // Same shape of fix as dockerExec above: swap process.stderr for
+          // "pipe" only inside inspect mode. The result of isSeLinux is just a
+          // boolean (proc.status === 0); we don't need to see selinuxenabled's
+          // stderr in the worker.
+          const seLinuxAnchor =
+            '("selinuxenabled",[],{stdio:["pipe",process.stderr,"inherit"]})';
+          if (!contents.includes(seLinuxAnchor)) {
+            throw new Error(
+              `Can not find '${seLinuxAnchor.substring(0, 30)}...' in ${args.path}. CDK version may not be supported.`,
+            );
+          }
+          contents = contents.replace(
+            seLinuxAnchor,
+            `("selinuxenabled",[],{stdio:["pipe",process.env.CDK_BOOSTER_INSPECT==='true'?"pipe":process.stderr,"inherit"]})`,
+          );
+
+          Logger.verbose(`Injected code into ${args.path}`);
         }
 
         // If --decorators=swc is on, pre-transpile user .ts files through SWC
