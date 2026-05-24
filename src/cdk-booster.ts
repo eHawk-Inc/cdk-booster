@@ -997,6 +997,44 @@ async function compileCdk({
           );
 
           Logger.verbose(`Injected code into ${args.path}`);
+        } else if (
+          args.path.includes(
+            path.join(
+              'aws-cdk-lib',
+              'core',
+              'lib',
+              'private',
+              'asset-staging.',
+            ),
+          )
+        ) {
+          // dockerExec in core/lib/private/asset-staging.js does
+          //   spawnSync(prog, args, options ?? {encoding:"utf-8", stdio:["ignore", process.stderr, "inherit"]})
+          // In a Worker thread (CDK_BOOSTER_INSPECT mode), `process.stderr` is a
+          // WritableWorkerStdio stream, which child_process rejects with
+          // `ERR_INVALID_ARG_VALUE`. This is hit by any Docker-based asset
+          // bundling that runs eagerly during stack construction (e.g. the
+          // `aws-lambda-python-alpha` PythonLayerVersion, which calls
+          // DockerImage.fromBuild → dockerExec at construct time).
+          //
+          // Swap to ["ignore","pipe","pipe"] in inspect mode. Output is lost
+          // but dockerExec's error path uses prependLines(...) which tolerates
+          // either string buffers (pipe) or undefined (inherit). Non-inspect
+          // (real synth in the main thread) keeps the original behavior so
+          // docker progress still streams to the user's terminal.
+          const dockerStdioAnchor =
+            'options??{encoding:"utf-8",stdio:["ignore",process.stderr,"inherit"]}';
+          if (!contents.includes(dockerStdioAnchor)) {
+            throw new Error(
+              `Can not find '${dockerStdioAnchor.substring(0, 30)}...' in ${args.path}. CDK version may not be supported.`,
+            );
+          }
+          contents = contents.replace(
+            dockerStdioAnchor,
+            `options??(process.env.CDK_BOOSTER_INSPECT==='true'?{encoding:"utf-8",stdio:["ignore","pipe","pipe"]}:{encoding:"utf-8",stdio:["ignore",process.stderr,"inherit"]})`,
+          );
+
+          Logger.verbose(`Injected code into ${args.path}`);
         }
 
         // If --decorators=swc is on, pre-transpile user .ts files through SWC
