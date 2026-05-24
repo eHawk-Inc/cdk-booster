@@ -532,6 +532,118 @@ async function compileCdk({
   tsconfig?: string;
 }) {
   const isESM = await isEsm(entryFile);
+  const useSwcForDecorators = Configuration.config.decorators === 'swc';
+
+  // Lazy SWC loader. We only pay the resolution cost when --decorators=swc is set.
+  // The transform itself is needed because esbuild does not emit Reflect.metadata
+  // calls for `emitDecoratorMetadata` (esbuild#257), which breaks runtime DI
+  // libraries that resolve constructor/field types from metadata.
+  let swcTransform:
+    | ((code: string, filename: string) => Promise<{ code: string }>)
+    | undefined;
+  // TypeScript compiler API, used to find type-only exports in each user TS
+  // file. Loaded together with SWC because the two passes are paired: SWC emits
+  // metadata code that hedges on imported names being undefined at runtime
+  // (`typeof X === "undefined" ? Object : X`), but esbuild's bundler will not
+  // accept an import of an export that doesn't exist. So for every
+  // `export interface X` / `export type X` (with no companion value export),
+  // we append `export const X = void 0;` to the SWC output. The hedge picks up
+  // the `undefined` and falls back to `Object`.
+  let ts: typeof import('typescript') | undefined;
+  if (useSwcForDecorators) {
+    try {
+      // @ts-ignore — optional peer dep, not in cdk-booster's own dependencies
+      const swc = await import('@swc/core');
+      swcTransform = (code, filename) =>
+        swc.transform(code, {
+          filename,
+          jsc: {
+            parser: { syntax: 'typescript', decorators: true },
+            target: 'es2020',
+            transform: {
+              legacyDecorator: true,
+              decoratorMetadata: true,
+            },
+            keepClassNames: true,
+          },
+          sourceMaps: 'inline',
+        });
+      ts = (await import('typescript')).default;
+      Logger.verbose(
+        `Decorator metadata mode: SWC will pre-transpile user .ts files (with type-only export stubbing)`,
+      );
+    } catch (err: any) {
+      throw new Error(
+        `--decorators=swc requires "@swc/core" to be installed in the project. Failed to import: ${err.message}`,
+        { cause: err },
+      );
+    }
+  }
+
+  // Returns the names of top-level type-only exports in the given TS source
+  // that have NO companion value declaration of the same name (so the
+  // declaration-merging case `interface Foo {} ; class Foo {}` is excluded —
+  // the class export already covers it).
+  const findOrphanTypeOnlyExports = (
+    sourceText: string,
+    fileName: string,
+  ): string[] => {
+    if (!ts) return [];
+    const sf = ts.createSourceFile(
+      fileName,
+      sourceText,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+
+    const typeOnly = new Set<string>();
+    const valueExported = new Set<string>();
+
+    const hasExport = (node: import('typescript').Node): boolean => {
+      if (!ts!.canHaveModifiers(node)) return false;
+      const modifiers = ts!.getModifiers(node) ?? [];
+      return modifiers.some((m) => m.kind === ts!.SyntaxKind.ExportKeyword);
+    };
+
+    for (const stmt of sf.statements) {
+      if (ts.isInterfaceDeclaration(stmt) && hasExport(stmt)) {
+        typeOnly.add(stmt.name.text);
+      } else if (ts.isTypeAliasDeclaration(stmt) && hasExport(stmt)) {
+        typeOnly.add(stmt.name.text);
+      } else if (ts.isClassDeclaration(stmt) && stmt.name && hasExport(stmt)) {
+        valueExported.add(stmt.name.text);
+      } else if (
+        ts.isFunctionDeclaration(stmt) &&
+        stmt.name &&
+        hasExport(stmt)
+      ) {
+        valueExported.add(stmt.name.text);
+      } else if (ts.isVariableStatement(stmt) && hasExport(stmt)) {
+        for (const decl of stmt.declarationList.declarations) {
+          if (ts.isIdentifier(decl.name)) valueExported.add(decl.name.text);
+        }
+      } else if (ts.isEnumDeclaration(stmt) && hasExport(stmt)) {
+        valueExported.add(stmt.name.text);
+      } else if (
+        ts.isExportDeclaration(stmt) &&
+        stmt.exportClause &&
+        ts.isNamedExports(stmt.exportClause)
+      ) {
+        const wholeIsTypeOnly = stmt.isTypeOnly;
+        for (const spec of stmt.exportClause.elements) {
+          const name = spec.name.text;
+          if (wholeIsTypeOnly || spec.isTypeOnly) {
+            typeOnly.add(name);
+          } else {
+            valueExported.add(name);
+          }
+        }
+      }
+    }
+
+    for (const v of valueExported) typeOnly.delete(v);
+    return [...typeOnly];
+  };
 
   // Plugin that:
   // - Fixes __dirname issues in bundled code
@@ -885,6 +997,114 @@ async function compileCdk({
           );
 
           Logger.verbose(`Injected code into ${args.path}`);
+        } else if (
+          args.path.includes(
+            path.join(
+              'aws-cdk-lib',
+              'core',
+              'lib',
+              'private',
+              'asset-staging.',
+            ),
+          )
+        ) {
+          // dockerExec in core/lib/private/asset-staging.js does
+          //   spawnSync(prog, args, options ?? {encoding:"utf-8", stdio:["ignore", process.stderr, "inherit"]})
+          // In a Worker thread (CDK_BOOSTER_INSPECT mode), `process.stderr` is a
+          // WritableWorkerStdio stream, which child_process rejects with
+          // `ERR_INVALID_ARG_VALUE`. This is hit by any Docker-based asset
+          // bundling that runs eagerly during stack construction (e.g. the
+          // `aws-lambda-python-alpha` PythonLayerVersion, which calls
+          // DockerImage.fromBuild → dockerExec at construct time).
+          //
+          // Swap to ["ignore","pipe","pipe"] in inspect mode. Output is lost
+          // but dockerExec's error path uses prependLines(...) which tolerates
+          // either string buffers (pipe) or undefined (inherit). Non-inspect
+          // (real synth in the main thread) keeps the original behavior so
+          // docker progress still streams to the user's terminal.
+          const dockerStdioAnchor =
+            'options??{encoding:"utf-8",stdio:["ignore",process.stderr,"inherit"]}';
+          if (!contents.includes(dockerStdioAnchor)) {
+            throw new Error(
+              `Can not find '${dockerStdioAnchor.substring(0, 30)}...' in ${args.path}. CDK version may not be supported.`,
+            );
+          }
+          contents = contents.replace(
+            dockerStdioAnchor,
+            `options??(process.env.CDK_BOOSTER_INSPECT==='true'?{encoding:"utf-8",stdio:["ignore","pipe","pipe"]}:{encoding:"utf-8",stdio:["ignore",process.stderr,"inherit"]})`,
+          );
+
+          Logger.verbose(`Injected code into ${args.path}`);
+        } else if (
+          args.path.includes(
+            path.join('aws-cdk-lib', 'core', 'lib', 'bundling.'),
+          )
+        ) {
+          // isSeLinux() in core/lib/bundling.js does:
+          //   spawnSync("selinuxenabled", [], { stdio: ["pipe", process.stderr, "inherit"] })
+          // It is called from DockerImage.run when building the `-v` mount
+          // args (SELinux relabel suffix). On Linux runners this fires for
+          // every Docker-backed asset bundling, including `PythonLayerVersion`
+          // during construct creation, and crashes the worker with
+          // ERR_INVALID_ARG_VALUE on the WritableWorkerStdio stream.
+          //
+          // Same shape of fix as dockerExec above: swap process.stderr for
+          // "pipe" only inside inspect mode. The result of isSeLinux is just a
+          // boolean (proc.status === 0); we don't need to see selinuxenabled's
+          // stderr in the worker.
+          const seLinuxAnchor =
+            '("selinuxenabled",[],{stdio:["pipe",process.stderr,"inherit"]})';
+          if (!contents.includes(seLinuxAnchor)) {
+            throw new Error(
+              `Can not find '${seLinuxAnchor.substring(0, 30)}...' in ${args.path}. CDK version may not be supported.`,
+            );
+          }
+          contents = contents.replace(
+            seLinuxAnchor,
+            `("selinuxenabled",[],{stdio:["pipe",process.env.CDK_BOOSTER_INSPECT==='true'?"pipe":process.stderr,"inherit"]})`,
+          );
+
+          Logger.verbose(`Injected code into ${args.path}`);
+        }
+
+        // If --decorators=swc is on, pre-transpile user .ts files through SWC
+        // so `emitDecoratorMetadata` produces `Reflect.metadata(...)` calls that
+        // typedi / tsyringe / class-validator etc. rely on at runtime. esbuild
+        // still handles bundling, the `define` substitutions for __dirname etc.,
+        // and the CDK-internal patches applied above.
+        if (
+          swcTransform &&
+          args.path.endsWith('.ts') &&
+          !args.path.includes('node_modules')
+        ) {
+          try {
+            // Collect orphan type-only exports from the ORIGINAL source (before
+            // SWC erases the type declarations) so we can stub them back in.
+            const orphanTypeExports = findOrphanTypeOnlyExports(
+              contents,
+              args.path,
+            );
+
+            const { code } = await swcTransform(contents, args.path);
+
+            let outCode = code;
+            if (orphanTypeExports.length > 0) {
+              const stubs = orphanTypeExports
+                .map((name) => `export const ${name} = void 0;`)
+                .join('\n');
+              outCode += `\n// cdk-booster: stubs for type-only exports (consumed by SWC's typeof-undefined hedge)\n${stubs}\n`;
+              Logger.verbose(
+                `Stubbed ${orphanTypeExports.length} type-only export(s) in ${args.path}: ${orphanTypeExports.join(', ')}`,
+              );
+            }
+
+            return { contents: outCode, loader: 'js' };
+          } catch (err: any) {
+            throw new Error(
+              `SWC failed to transpile ${args.path}: ${err.message}`,
+              { cause: err },
+            );
+          }
         }
 
         return {
@@ -912,6 +1132,21 @@ async function compileCdk({
       sourcemap: true,
       plugins: [injectCodePlugin],
       tsconfig: tsconfig,
+      // When SWC pre-transpiles user .ts files, it cannot tell whether an
+      // import is type-only across file boundaries. With `decoratorMetadata`
+      // it pessimistically preserves the import so it can be referenced by
+      // a generated `Reflect.metadata("design:type", T)` call. If T's source
+      // file only exports an interface/type alias, the export evaporates
+      // after transpile and esbuild rejects the now-dangling import.
+      // tsc avoids this with cross-file type info; the eHawk app currently
+      // relies on Node's lenient module loader to ignore it. Downgrade the
+      // hard error to a warning so esbuild resolves the missing export to
+      // `undefined` (matching Node's runtime behavior). Safe because the
+      // affected refs are either erased type positions or harmless
+      // `Reflect.metadata(..., undefined)` calls.
+      ...(useSwcForDecorators
+        ? { logOverride: { 'import-is-undefined': 'warning' as const } }
+        : {}),
       ...(isESM
         ? {
             format: 'esm',
