@@ -1,4 +1,5 @@
 node_modules
+publish-local.bat
 dist
 .vitepress/dist
 .vitepress/cache
